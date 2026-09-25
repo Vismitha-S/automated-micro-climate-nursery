@@ -1,3 +1,30 @@
+/*
+ * ============================================================
+ * AUTOMATED COMMERCIAL MICRO-CLIMATE NURSERY
+ * ============================================================
+ *
+ * The ESP32 monitors temperature, humidity and natural light
+ * and controls a servo-operated ventilation window and
+ * supplemental lighting.
+ *
+ * MAIN CONTROL PRIORITY:
+ *     SAFETY > MANUAL > AUTO
+ *
+ * SAFETY:
+ *     Invalid DHT22 data -> Safety Mode -> vent OPEN + warning.
+ *
+ * MANUAL:
+ *     Button toggles Auto <-> Manual. Manual mode keeps the vent OPEN.
+ *
+ * AUTOMATIC:
+ *     Temperature controls the vent.
+ *     LDR light level controls supplemental lighting.
+ *
+ * The GPIO mapping and working control behaviour are unchanged.
+ *
+ * ============================================================
+ */
+
 #include <Wire.h>
 #include <Adafruit_GFX.h>
 #include <Adafruit_SSD1306.h>
@@ -74,8 +101,12 @@ const float TEMP_CLOSE = 28.0;
 // LIGHT THRESHOLD
 // ============================================================
 
-// Higher LDR value = darker
-// Above 700 = low light
+// IMPORTANT LDR BEHAVIOUR:
+// In this Wokwi photoresistor module, a higher ADC value means less light.
+// Therefore:
+//     LDR > 700  -> dark / low light
+//     LDR <= 700 -> bright / enough natural light
+// The threshold is kept simple for this prototype.
 
 const int LIGHT_THRESHOLD = 700;
 
@@ -132,6 +163,10 @@ const unsigned long BUTTON_DEBOUNCE = 200;
  */
 void setVent(bool open)
 {
+  // This is the single function used to change the physical vent position.
+  // Other parts of the program request OPEN/CLOSED by calling setVent().
+  //     setVent(true)  -> open the vent
+  //     setVent(false) -> close the vent
   ventOpen = open;
 
   if (open)
@@ -158,6 +193,9 @@ void setVent(bool open)
  */
 void updateBuzzer()
 {
+  // These static variables remember their values between calls.
+  // This lets the buzzer beep without using delay(), so the rest of
+  // the system can continue running at the same time.
   static unsigned long lastBeepTime = 0;
   static bool beepState = false;
 
@@ -262,6 +300,8 @@ void updateLEDs()
  */
 void readSensors()
 {
+  // Read into temporary variables first. The values are copied into the
+  // main variables only after the DHT22 readings pass the validity checks.
   float newTemperature = dht.readTemperature();
   float newHumidity = dht.readHumidity();
 
@@ -269,6 +309,10 @@ void readSensors()
   // CHECK DHT22
   // ==========================================================
 
+  // The DHT22 is the primary safety sensor. NaN means the sensor did not
+  // return a valid number. Range checks reject values that are not valid
+  // for this project. If the check fails, automatic control is stopped
+  // and the system immediately enters Safety Mode.
   if (isnan(newTemperature) ||
       isnan(newHumidity) ||
       newHumidity < 0 ||
@@ -312,6 +356,8 @@ void readSensors()
   // READ LDR
   // ==========================================================
 
+  // GPIO 34 is an ESP32 ADC input. analogRead() converts the LDR voltage
+  // into a numeric ADC value used by the light-control logic.
   lightLevel = analogRead(LDR_PIN);
 
   // ==========================================================
@@ -344,6 +390,11 @@ void readSensors()
  */
 void handleButton()
 {
+  // The button uses INPUT_PULLUP:
+  //     HIGH = released
+  //     LOW  = pressed
+  // The HIGH -> LOW transition is detected so holding the button does
+  // not repeatedly switch the operating mode.
   bool buttonState = digitalRead(BUTTON_PIN);
 
   // Detect new button press
@@ -414,6 +465,8 @@ void handleButton()
  */
 void runAutomaticControl()
 {
+  // Automatic rules are allowed to run only in AUTO_MODE. This prevents
+  // automatic control from overriding Manual Override or Safety Mode.
   if (currentMode != AUTO_MODE)
   {
     return;
@@ -423,6 +476,13 @@ void runAutomaticControl()
   // TEMPERATURE CONTROL
   // ==========================================================
 
+  // Temperature controls the ventilation window.
+  // At 30°C or above, the nursery is considered too hot -> OPEN the vent.
+  // At 28°C or below, it has cooled enough -> CLOSE the vent.
+  // Between 28°C and 30°C, keep the previous position.
+  //
+  // This gap is called HYSTERESIS. It prevents the servo from repeatedly
+  // opening and closing when the temperature is close to a threshold.
   if (temperature >= TEMP_OPEN)
   {
     // Temperature too high
@@ -441,14 +501,16 @@ void runAutomaticControl()
   // SIMPLE LIGHT CONTROL
   // ==========================================================
 
+  // The LDR controls only the supplemental lighting.
+  // In this Wokwi setup, a higher ADC value means darker conditions.
   if (lightLevel > LIGHT_THRESHOLD)
   {
-    // Low natural light
+    // Low natural light -> turn supplemental light ON.
     supplementalLight = true;
   }
   else
   {
-    // Enough natural light
+    // Enough natural light -> turn supplemental light OFF.
     supplementalLight = false;
   }
 }
@@ -467,6 +529,9 @@ void runAutomaticControl()
  */
 void runManualControl()
 {
+  // Manual Override controls the ventilation, but the LDR lighting
+  // function can still operate. The worker is overriding automatic
+  // ventilation rather than disabling the whole system.
   if (currentMode == MANUAL_MODE)
   {
     // Manual mode keeps vent OPEN
@@ -498,6 +563,9 @@ void runManualControl()
  */
 void runSafetyControl()
 {
+  // Safety Mode has the highest priority. The predefined safe posture
+  // is to keep the vent OPEN and supplemental lighting OFF when the
+  // primary environmental sensor has failed.
   if (currentMode == SAFETY_MODE)
   {
     // Safety posture
@@ -797,6 +865,8 @@ void printSerialStatus()
  */
 void setup()
 {
+  // setup() runs once after the ESP32 starts. Hardware pins, sensors,
+  // I2C, OLED and servo are initialized here.
   Serial.begin(115200);
 
   // ==========================================================
@@ -908,6 +978,8 @@ void setup()
  */
 void loop()
 {
+  // millis() returns elapsed milliseconds since startup. It is used
+  // instead of delay() so timed tasks do not block the rest of the system.
   unsigned long currentTime = millis();
 
   // ==========================================================
@@ -931,8 +1003,15 @@ void loop()
   // CONTROL PRIORITY
   //
   // SAFETY > MANUAL > AUTO
+  //
+  // 1. Safety Mode always overrides everything else.
+  // 2. Manual Override is checked next.
+  // 3. Automatic control runs only when neither higher-priority
+  //    condition is active.
   // ==========================================================
 
+  // Run exactly one control routine according to the priority above.
+  // This prevents two modes from trying to control the vent at once.
   if (currentMode == SAFETY_MODE)
   {
     runSafetyControl();
